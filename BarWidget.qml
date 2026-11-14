@@ -324,7 +324,13 @@ BarWidget {
   readonly property bool glassOn: glassGate.count > 0
   onGlassOnChanged: {
     if (!glassOn) glassRulesAgain = false               // switched off: no queued repeat
-    else if (primary) glassRulesWorker.running = true
+    else addGlassRules()
+  }
+  // Every trigger goes through here: run now, or once more right after the call that runs.
+  function addGlassRules() {
+    if (!glassOn || !primary) return
+    if (glassRulesWorker.running) glassRulesAgain = true
+    else glassRulesWorker.running = true
   }
   // A reload while the rules are being added: added once more right after.
   property bool glassRulesAgain: false
@@ -334,16 +340,14 @@ BarWidget {
     onRunningChanged: {
       if (running || !root.glassRulesAgain) return
       root.glassRulesAgain = false
-      if (root.glassOn && root.primary) running = true      // only while still switched on
+      root.addGlassRules()                                  // only while still switched on
     }
   }
   Connections {
     target: Hyprland
     enabled: root.primary && root.glassOn
     function onRawEvent(event) {
-      if (event.name !== "configreloaded") return
-      if (glassRulesWorker.running) root.glassRulesAgain = true
-      else glassRulesWorker.running = true
+      if (event.name === "configreloaded") root.addGlassRules()
     }
   }
 
