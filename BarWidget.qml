@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
+import Qt.labs.folderlistmodel
 import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
@@ -304,6 +305,34 @@ BarWidget {
   onTilingActiveChanged: if (tilingActive) {
     var windows = openWindows()
     for (var i = 0; i < windows.length; i++) markTilingSeen(windows[i])
+  }
+
+  // Settings → "Plugin popups follow window style" (the marker file popup-glass in Theme
+  // Manager's folder; only its name is listed). While it is there, Hyprland gets, at run time
+  // and again after every config reload (which drops run-time rules), a blur rule for our own
+  // layer popups (blurred only while Hyprland's blur is on and only behind a see-through card)
+  // and Omarchy's window transparency for our app windows. No config file is edited; switched
+  // off, the rules go with the next reload.
+  readonly property string glassRules: 'hl.layer_rule({ match = { namespace = "^(theme-manager|simple-launcher-for-fools|app-manager-dock|bar-organizer)$" }, blur = true, ignore_alpha = 0.3 }) '
+    + 'o.transparent_window("^(org[.]omarchy[.]aiagentsmap|org[.]omarchy[.]settingsmanager)$")'
+  FolderListModel {
+    id: glassGate
+    folder: "file://" + (Quickshell.env("HOME") + "/.config/omarchy/theme-manager").split("/").map(encodeURIComponent).join("/")
+    nameFilters: ["popup-glass"]
+    showDirs: false
+  }
+  readonly property bool glassOn: glassGate.count > 0
+  onGlassOnChanged: if (glassOn && primary) glassRulesWorker.running = true
+  Process {
+    id: glassRulesWorker
+    command: root.bounded(10, ["hyprctl", "eval", root.glassRules])
+  }
+  Connections {
+    target: Hyprland
+    enabled: root.primary && root.glassOn
+    function onRawEvent(event) {
+      if (event.name === "configreloaded" && !glassRulesWorker.running) glassRulesWorker.running = true
+    }
   }
 
   Connections {

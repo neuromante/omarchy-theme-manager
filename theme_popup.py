@@ -2794,8 +2794,8 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
                           self.switch(theme_core.sync_enabled(), self.set_omarchy_sync))
         self.setting_line(box, _("Plugin popups follow window style"),
                           _("Popups of Theme Manager and the other ubruckhaus plugins become see-through "
-                          "with Transparent and blurred with Glassy windows (Font & effects). Writes "
-                          "theme-manager-glass.lua and one marked line in hyprland.lua; off removes them."),
+                          "with Transparent and blurred with Glassy windows (Font & effects). Hyprland "
+                          "gets the blur rules while Theme Manager runs; no config file is changed."),
                           self.switch(popup_glass.enabled(), self.set_popup_glass))
 
         plan = theme_auto.schedule()
