@@ -323,15 +323,20 @@ BarWidget {
   }
   readonly property bool glassOn: glassGate.count > 0
   onGlassOnChanged: if (glassOn && primary) glassRulesWorker.running = true
+  // A reload while the rules are being added: added once more right after.
+  property bool glassRulesAgain: false
   Process {
     id: glassRulesWorker
     command: root.bounded(10, ["hyprctl", "eval", root.glassRules])
+    onRunningChanged: if (!running && root.glassRulesAgain) { root.glassRulesAgain = false; running = true }
   }
   Connections {
     target: Hyprland
     enabled: root.primary && root.glassOn
     function onRawEvent(event) {
-      if (event.name === "configreloaded" && !glassRulesWorker.running) glassRulesWorker.running = true
+      if (event.name !== "configreloaded") return
+      if (glassRulesWorker.running) root.glassRulesAgain = true
+      else glassRulesWorker.running = true
     }
   }
 

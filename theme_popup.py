@@ -5036,11 +5036,13 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
         self.save_schedule(then=told, **{key: theme.slug})
 
     def set_popup_glass(self, on: bool):
-        def done(_r, error):
-            if error:
-                theme_core.notify(_("Could not change the popup style"), str(error))
-            self.apply_theme_css()
-        self._async(lambda: popup_glass.set_enabled(on), done)
+        """On the ordered settings worker, so quick on/off clicks end in the last choice."""
+        def write():
+            try:
+                popup_glass.set_enabled(on)
+            except RuntimeError as error:
+                raise OSError(str(error)) from error
+        self._save_in_background(write, then=self.apply_theme_css)
 
     def set_omarchy_sync(self, on: bool):
         def apply():
