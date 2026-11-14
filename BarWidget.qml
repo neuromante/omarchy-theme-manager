@@ -326,6 +326,7 @@ BarWidget {
     if (!glassOn) glassRulesAgain = false               // switched off: no queued repeat
     else addGlassRules()
   }
+  onPrimaryChanged: if (primary) addGlassRules()         // this bar became the first monitor's
   // Every trigger goes through here: run now, or once more right after the call that runs.
   function addGlassRules() {
     if (!glassOn || !primary) return
