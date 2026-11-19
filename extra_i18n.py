@@ -689,3 +689,13 @@ EXTRA['Set the shown wallpaper as background'] = {
     'nl': 'Getoonde achtergrond als bureaubladachtergrond instellen',
     'pl': 'Ustaw pokazaną tapetę jako tło',
 }
+
+EXTRA['Apply'] = {
+    'de': 'Anwenden',
+    'fr': 'Appliquer',
+    'es': 'Aplicar',
+    'it': 'Applica',
+    'pt': 'Aplicar',
+    'nl': 'Toepassen',
+    'pl': 'Zastosuj',
+}

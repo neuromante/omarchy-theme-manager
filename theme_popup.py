@@ -197,6 +197,7 @@ class FlipPicture(FixedPicture):
         self._badges: Gtk.Widget | None = None
         self._pin_button: Gtk.Button | None = None
         self._apply_button: Gtk.Button | None = None
+        self._apply_label: Gtk.Label | None = None
         self._nav_buttons: tuple[Gtk.Button, ...] = ()
         self._shown_pin_state = None
         self._textures: dict[str, Gdk.Paintable] = {}
@@ -207,6 +208,7 @@ class FlipPicture(FixedPicture):
         self._hovered = False
         self._interactive = False  # True once rotation or manual arrow mode is active
         self._nav_steady = False   # True once arrow controls stay up across preview + wallpapers
+        self._always_nav = False   # the big preview: arrows up at once and after any reset
         self._from_face = -1   # -1 = front preview, 0..N-1 = wallpaper index
         self._to_face = 0
         self._direction = 1.0
@@ -235,11 +237,18 @@ class FlipPicture(FixedPicture):
         self._shown_pin_state = None
         self._sync_overlays()
 
-    def set_apply_button(self, button: Gtk.Button | None):
+    def set_apply_button(self, button: Gtk.Button | None, label: Gtk.Label | None = None):
         """The big preview's Apply: for the theme in use it is enabled only while a wallpaper
-        other than the desktop's is shown (Apply then sets that one)."""
+        other than the desktop's is shown (Apply then sets that one, and reads "Apply");
+        otherwise it reads "Apply theme"."""
         self._apply_button = button
+        self._apply_label = label
         self._sync_overlays()
+
+    def wallpaper_change(self) -> bool:
+        """The theme in use, rotated to a wallpaper that is not the desktop's: Apply changes
+        only the background."""
+        return self._theme_current and self.apply_would_change()
 
     def apply_would_change(self) -> bool:
         if not self._theme_current:
@@ -540,6 +549,7 @@ class FlipPicture(FixedPicture):
         auto-rotates after _delay_ms only when enabled (delay_s > 0)."""
         if not self._wallpapers:
             return
+        self._always_nav = True
         self._selected = True
         self._interactive = True
         self._nav_steady = True
@@ -573,7 +583,13 @@ class FlipPicture(FixedPicture):
         return ((face + 1 + delta) % (n + 1)) - 1
 
     def rotate_step(self, step_dir: int):
-        if not self._wallpapers or not self._interactive:
+        if not self._wallpapers:
+            return
+        if self._always_nav:
+            # The big preview's arrows work at once, also after a reset (hidden and shown again).
+            self._interactive = True
+            self._nav_steady = True
+        if not self._interactive:
             return
         if not self._nav_steady and not self.is_showing_wallpaper():
             return
@@ -684,10 +700,9 @@ class FlipPicture(FixedPicture):
             else:
                 self._badges.set_opacity(0.0)
         face_opacity = max(0.0, 1.0 - abs(local_deg) / 55.0)
-        show_nav = bool(self._wallpapers) and (
-            (self._interactive and self._nav_steady) or face >= 0
-        )
-        nav_opacity = 1.0 if (self._interactive and self._nav_steady) else face_opacity
+        steady_nav = self._always_nav or (self._interactive and self._nav_steady)
+        show_nav = bool(self._wallpapers) and (steady_nav or face >= 0)
+        nav_opacity = 1.0 if steady_nav else face_opacity
         for nav in self._nav_buttons:
             nav.set_visible(show_nav)
             nav.set_opacity(nav_opacity if show_nav else 0.0)
@@ -699,6 +714,8 @@ class FlipPicture(FixedPicture):
                                       else _("Next wallpaper"))
         if self._apply_button is not None:
             self._apply_button.set_sensitive(self.apply_would_change())
+        if self._apply_label is not None:
+            self._apply_label.set_label(_("Apply") if self.wallpaper_change() else _("Apply theme"))
         pin = self._pin_button
         if pin is None:
             return
@@ -6010,14 +6027,15 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
             apply_btn.add_css_class("tm-big-btn")
             apply_row = Gtk.Box(spacing=4)
             apply_row.append(Gtk.Image.new_from_icon_name("media-playback-start-symbolic"))
-            apply_row.append(Gtk.Label(label=_("Apply theme")))
+            apply_label = Gtk.Label(label=_("Apply theme"))
+            apply_row.append(apply_label)
             apply_btn.set_child(apply_row)
             apply_btn.connect("clicked", lambda *_, target=theme, pic=picture: self.apply_from_big_preview(target, pic))
             if theme.current:
                 apply_btn.set_tooltip_text(_("Set the shown wallpaper as background"))
             footer.append(apply_btn)
             if rotatable:
-                picture.set_apply_button(apply_btn)
+                picture.set_apply_button(apply_btn, apply_label)
         if theme.current and self.look_pending.get(theme.slug):
             reapply_btn = Gtk.Button()
             reapply_btn.add_css_class("tm-paste")

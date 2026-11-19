@@ -3135,6 +3135,41 @@ class Flip3DTests(ViewLayerTest):
         other.set_apply_button(other_btn)
         self.assertTrue(other_btn.get_sensitive())            # another theme: always applicable
 
+    def test_big_preview_apply_reads_apply_for_a_wallpaper_change(self):
+        pic = theme_popup.FlipPicture(40, 30, wallpapers=["/t/a.png", "/t/b.png"],
+                                      active_bg="/t/a.png", theme_current=True)
+        button, label = theme_popup.Gtk.Button(), theme_popup.Gtk.Label()
+        pic.set_apply_button(button, label)
+        self.assertEqual(label.get_label(), theme_popup._("Apply theme"))     # theme face
+        pic._from_face = pic._to_face = 1                                       # b.png: only the wallpaper changes
+        pic._sync_overlays()
+        self.assertEqual(label.get_label(), theme_popup._("Apply"))
+        pic._from_face = pic._to_face = 0                                       # a.png, the desktop's
+        pic._sync_overlays()
+        self.assertEqual(label.get_label(), theme_popup._("Apply theme"))
+        other = theme_popup.FlipPicture(40, 30, wallpapers=["/t/a.png", "/t/b.png"], theme_current=False)
+        other_btn, other_label = theme_popup.Gtk.Button(), theme_popup.Gtk.Label()
+        other.set_apply_button(other_btn, other_label)
+        other._from_face = other._to_face = 1
+        other._sync_overlays()
+        self.assertEqual(other_label.get_label(), theme_popup._("Apply theme"))  # another theme keeps it
+
+    def test_big_preview_arrows_show_at_once_and_after_a_reset(self):
+        pic = theme_popup.FlipPicture(40, 30, wallpapers=["/t/a.png", "/t/b.png"], delay_s=0)
+        prev_btn, next_btn = theme_popup.Gtk.Button(), theme_popup.Gtk.Button()
+        pic.set_nav_buttons(prev_btn, next_btn)
+        pic._sync_overlays()
+        self.assertFalse(next_btn.get_visible())          # a list tile: arrows only after a flip
+        pic.start_big_preview()
+        self.assertTrue(next_btn.get_visible())
+        self.assertEqual(next_btn.get_opacity(), 1.0)
+        pic.reset_flip()                                  # hidden and shown again
+        self.assertTrue(next_btn.get_visible())
+        self.assertEqual(next_btn.get_opacity(), 1.0)
+        pic.rotate_step(1)                                # the arrow still turns the picture
+        self.assertTrue(pic._interactive and pic._nav_steady)
+        self.assertEqual(pic._target, 1.0)
+
     def test_another_themes_first_wallpaper_is_not_pinned_unless_remembered(self):
         from types import SimpleNamespace
         theme = SimpleNamespace(current=False, slug="gamma")
