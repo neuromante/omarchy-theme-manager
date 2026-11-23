@@ -217,6 +217,196 @@ class BoundedRunTests(unittest.TestCase):
         self.assertTrue(self.wait_gone(child, bounded_run.GRACE + 5))
 
 
+    def test_sigkill_to_the_supervisor_during_its_own_cleanup_after_the_leader_exited(self):
+        # The window of the 2.6.9 review: the leader exited, the supervisor is ending the group
+        # (its child ignores SIGTERM, so the supervisor is inside the grace) and is killed there.
+        # init then reaps the leader; the watchdog must still end the child.
+        proc = self.start(60, "term_ignored", "exit")
+        child = self.child_pid()
+        end = time.monotonic() + 10
+        while time.monotonic() < end and alive(os.getpgid(child)):
+            time.sleep(0.02)                                 # the leader has exited
+        time.sleep(0.5)                                      # the supervisor is in its grace now
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+        self.assertTrue(self.wait_gone(child, bounded_run.GRACE + 5))
+
+    def test_sigkill_to_the_supervisor_during_the_grace_of_a_stop(self):
+        proc = self.start(60, "term_ignored", "stay")
+        child = self.child_pid()
+        time.sleep(0.2)
+        proc.send_signal(signal.SIGTERM)                     # the supervisor starts ending the group
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGKILL)                     # ... and dies in the middle of it
+        proc.wait(timeout=10)
+        self.assertTrue(self.wait_gone(child, bounded_run.GRACE + 5))
+
+    def test_sigkill_to_the_supervisor_right_after_the_start(self):
+        code = ("import subprocess,sys;"
+                "subprocess.Popen([sys.executable,'-c','import os,sys,time;"
+                "open(sys.argv[1],\'w\').write(str(os.getpid()));time.sleep(300)',sys.argv[1]])")
+        proc = subprocess.Popen([sys.executable, "-I", SUPERVISOR, "--report-start", "60", "--",
+                                 sys.executable, "-c", code, self.pidfile],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.assertEqual(proc.stdout.readline().strip(), bounded_run.STARTED_LINE)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=10)
+        # The group may already be gone before the child wrote its pid; if it did, it must end.
+        time.sleep(bounded_run.GRACE + 2)
+        try:
+            child = int(Path(self.pidfile).read_text())
+        except (OSError, ValueError):
+            return
+        self.assertFalse(alive(child))
+
+
+class WatchdogHandOverTests(unittest.TestCase):
+    """The watchdog with a real program, driven step by step (2.6.12)."""
+
+    def setUp(self):
+        import socket
+        self.info_parent, self.info_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.alive_r, self.alive_w = os.pipe()
+        self.addCleanup(self.close_all)
+        self.kids = []
+        self.addCleanup(self.kill_kids)
+
+    def close_all(self):
+        for sock in (self.info_parent, self.info_child):
+            sock.close()
+        for fd in (self.alive_r, self.alive_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def kill_kids(self):
+        for pid in self.kids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+    def start_program(self, ignore_term=True):
+        """A program started as the supervisor starts it; it leaves a child in its group and exits."""
+        body = "import signal,time\n" + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "") + \
+            "time.sleep(120)\n"
+        code = ("import subprocess,sys;p=subprocess.Popen([sys.executable,'-c',%r]);print(p.pid,flush=True)" % body)
+        leader = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, stdout=subprocess.PIPE,
+                                  text=True, preexec_fn=bounded_run._child_setup(os.getpid(), self.info_parent))
+        child = int(leader.stdout.readline())
+        leader.stdout.close()
+        self.kids.append(child)
+        return leader, child
+
+    def run_watchdog(self, grace=0.5):
+        import threading
+        thread = threading.Thread(target=bounded_run.watchdog, args=(self.info_child, self.alive_r, grace))
+        thread.start()
+        return thread
+
+    def wait_gone(self, pid, timeout):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if not alive(pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_the_leader_reaped_before_the_watchdog_reads_its_message(self):
+        # 2.6.11 read the group from the pidfd's fdinfo, which says "Pid: -1" once the leader is
+        # reaped, and gave up before any group signal: the child outlived the supervisor.
+        leader, child = self.start_program()
+        leader.wait()                                         # reaped (as init does)
+        os.close(self.alive_w)                               # the supervisor died: no "done"
+        self.alive_w = -1
+        thread = self.run_watchdog()
+        thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(self.wait_gone(child, 3))
+
+    def test_a_done_with_something_left_in_the_group_still_ends_it(self):
+        leader, child = self.start_program(ignore_term=False)
+        os.write(self.alive_w, b"d")                         # a "done" that is not true
+        thread = self.run_watchdog()
+        thread.join(15)
+        self.assertTrue(self.wait_gone(child, 3))
+        leader.wait()
+
+    def test_a_true_done_ends_nothing(self):
+        leader, child = self.start_program(ignore_term=False)
+        os.kill(child, signal.SIGKILL)
+        self.assertTrue(self.wait_gone(child, 3))
+        sent = []
+        original = bounded_run._group_signal
+        bounded_run._group_signal = lambda *a: sent.append(a) or original(*a)
+        try:
+            os.write(self.alive_w, b"d")
+            thread = self.run_watchdog()
+            thread.join(15)
+        finally:
+            bounded_run._group_signal = original
+        self.assertEqual(sent, [])
+        leader.wait()
+
+    def test_no_message_and_hostile_messages(self):
+        self.assertIsNone(bounded_run._parse_info(b""))
+        self.assertIsNone(bounded_run._parse_info(b"p"))
+        self.assertIsNone(bounded_run._parse_info(b"p1"))            # never init
+        self.assertIsNone(bounded_run._parse_info(b"p-5"))
+        self.assertIsNone(bounded_run._parse_info(b"p12a"))
+        self.assertIsNone(bounded_run._parse_info(b"p" + b"9" * 20))
+        self.assertEqual(bounded_run._parse_info(b"p4242"), 4242)
+        self.info_parent.close()                             # the program never started
+        os.close(self.alive_w)
+        self.alive_w = -1
+        thread = self.run_watchdog()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+    def test_an_old_kernel_reaches_the_group_by_number_only_while_it_has_members(self):
+        import errno
+        leader, child = self.start_program()
+        pidfd = os.pidfd_open(leader.pid)
+        self.addCleanup(os.close, pidfd)
+        leader.wait()                                         # reaped: the pidfd alone proves nothing
+        real = signal.pidfd_send_signal
+
+        def old_kernel(fd, sig, info=None, flags=0):
+            if flags:
+                raise OSError(errno.EINVAL, "flags")
+            return real(fd, sig, info, flags)
+        signal.pidfd_send_signal = old_kernel
+        try:
+            self.assertTrue(bounded_run._group_left(pidfd, leader.pid))
+            self.assertTrue(bounded_run._group_signal(pidfd, leader.pid, signal.SIGKILL))
+            self.assertTrue(self.wait_gone(child, 3))
+            self.assertFalse(bounded_run._group_left(pidfd, leader.pid))
+            self.assertFalse(bounded_run._group_signal(pidfd, leader.pid, signal.SIGTERM))   # never a stale number
+        finally:
+            signal.pidfd_send_signal = real
+
+    def test_the_supervisor_says_done_only_for_an_empty_group(self):
+        writes = []
+        real_write = os.write
+
+        def record(fd, data):
+            writes.append(data)
+            return real_write(fd, data)
+        with tempfile.TemporaryDirectory() as tmp:
+            for empty in (True, False):
+                writes.clear()
+                original = bounded_run.wait_group_empty
+                bounded_run.wait_group_empty = lambda pgid, seconds: empty
+                os.write = record
+                try:
+                    code = bounded_run.run(5, ["/usr/bin/true"], grace=0.2)
+                finally:
+                    os.write = real_write
+                    bounded_run.wait_group_empty = original
+                self.assertEqual(code, 0)
+                self.assertEqual(b"d" in writes, empty)
+
+
 class BarWidgetUsesTheSupervisorTests(unittest.TestCase):
     def setUp(self):
         self.qml = (ROOT / "BarWidget.qml").read_text()

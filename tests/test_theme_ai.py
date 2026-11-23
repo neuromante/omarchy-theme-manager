@@ -459,7 +459,7 @@ class GpuReleaseTests(unittest.TestCase):
             return "{}"
         with patch.object(theme_ai, "local_model", return_value=model), \
                 patch.object(theme_ai, "ensure_local_server"), \
-                patch.object(theme_ai, "_run_helper", side_effect=fake_run):
+                patch.object(theme_ai, "ask_local", side_effect=fake_run):
             theme_ai.run("pi:local/" + model["model"], "p")
 
     def test_only_what_an_ask_loaded_is_unloaded_and_keep_is_kept(self):
@@ -490,7 +490,7 @@ class GpuReleaseTests(unittest.TestCase):
             return "{}"
         with patch.object(theme_ai, "local_model", return_value=qwen), \
                 patch.object(theme_ai, "ensure_local_server"), \
-                patch.object(theme_ai, "_run_helper", side_effect=fake_run):
+                patch.object(theme_ai, "ask_local", side_effect=fake_run):
             theme_ai.run("pi:local/qwen", "p")
         self.assertEqual(seen, [[theme_ai.local_key(qwen)]])
         with patch.object(theme_ai, "_http_json", return_value=None):
@@ -680,6 +680,183 @@ class PortOwnerTests(unittest.TestCase):
         self.assertIsNone(theme_ai._unchunk(b"zz\r\nx"))
 
 
+class ConnectionOwnerTests(unittest.TestCase):
+    """Marketplace review 2.6.9: the trust decision is bound to the very connection used, so a
+    listener replaced after a check can neither read the prompt nor answer for the model."""
+
+    def server(self, reply=b"", pause=0.0, drip=None):
+        """A real loopback server that records every byte it receives."""
+        import socket
+        import threading
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        got = bytearray()
+        state = {"listener": listener, "got": got, "headers": None}
+
+        def run():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(3)
+                try:
+                    while b"\r\n\r\n" not in got:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            return
+                        got.extend(chunk)
+                    head, _sep, rest = bytes(got).partition(b"\r\n\r\n")
+                    length = next((int(l.split(b":")[1]) for l in head.split(b"\r\n")
+                                   if l.lower().startswith(b"content-length:")), 0)
+                    while len(rest) < length:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        got.extend(chunk)
+                        rest += chunk
+                    if drip:
+                        for piece in drip:
+                            conn.sendall(piece)
+                            time.sleep(pause)
+                    else:
+                        conn.sendall(reply)
+                except OSError:
+                    pass
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(listener.close)
+        return listener.getsockname()[1], state
+
+    @staticmethod
+    def chat_reply(content, status=b"200 OK"):
+        body = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
+        return b"HTTP/1.1 " + status + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+
+    def model(self, port, key=None):
+        return {"provider": "llama", "model": "m", "host": "127.0.0.1", "port": port, "path": "/v1", "key": key}
+
+    def foreign(self):
+        other = os.getuid() + 1 if os.getuid() >= 1000 else 4242
+        return patch.object(theme_ai, "_socket_owner", return_value=(theme_ai.TCP_ESTABLISHED, other))
+
+    def test_a_real_connection_is_checked_and_answered(self):
+        port, state = self.server(self.chat_reply('{"candidates": []}'))
+        self.assertEqual(theme_ai.ask_local(self.model(port, key="local"), "hello"), '{"candidates": []}')
+        request = bytes(state["got"])
+        self.assertTrue(request.startswith(b"POST /v1/chat/completions HTTP/1.0\r\n"))
+        self.assertIn(b"\r\nAuthorization: Bearer local\r\n", request)
+        body = json.loads(request.partition(b"\r\n\r\n")[2])
+        self.assertEqual((body["model"], body["messages"][0]["content"], body["stream"]), ("m", "hello", False))
+
+    def test_a_listener_replaced_after_the_check_gets_nothing(self):
+        # The port check said yes (stale: the trusted listener has gone since), and another
+        # account's listener now holds the port. The connection's own check refuses before
+        # a byte is sent: no prompt reaches it and nothing it says is used.
+        port, state = self.server(self.chat_reply("evil"))
+        with patch.object(theme_ai, "port_is_trusted", return_value=True), self.foreign():
+            with self.assertRaises(RuntimeError):
+                theme_ai.ask_local(self.model(port), "secret prompt")
+            self.assertIsNone(theme_ai._http_json("GET", "127.0.0.1", port, "/models"))
+        time.sleep(0.2)
+        self.assertEqual(bytes(state["got"]), b"")
+
+    def test_check_then_swap_then_connect(self):
+        # A real trusted listener passes the port check, then it exits and a second listener
+        # (standing in for another account's) takes the port before the connection is made.
+        import socket
+        first = socket.socket()
+        first.bind(("127.0.0.1", 0))
+        first.listen(1)
+        port = first.getsockname()[1]
+        self.assertIs(theme_ai.port_is_trusted(port), True)
+        first.close()
+        second = socket.socket()
+        second.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        second.bind(("127.0.0.1", port))
+        second.listen(1)
+        self.addCleanup(second.close)
+        real = theme_ai._socket_owner
+
+        def owner(family, src, dst):
+            found = real(family, src, dst)              # the kernel's real answer for this connection
+            self.assertEqual(src[1], port)
+            other = os.getuid() + 1 if os.getuid() >= 1000 else 4242
+            return (found[0], other) if found else None   # ... as if `second` were another account's
+        with patch.object(theme_ai, "_socket_owner", side_effect=owner):
+            self.assertIsNone(theme_ai._trusted_connection("127.0.0.1", port, 1.0))
+        second.settimeout(1)
+        conn, _ = second.accept()
+        with conn:
+            conn.settimeout(0.3)
+            try:
+                data = conn.recv(100)
+            except OSError:
+                data = b""
+        self.assertEqual(data, b"")                     # refused before anything was sent
+
+    def test_a_half_open_server_socket_or_no_answer_is_not_trusted(self):
+        port, state = self.server(self.chat_reply("x"))
+        with patch.object(theme_ai, "PEER_SETTLE", 0.1):
+            # The kernel reports a SYN_RECV request socket with owner 0: never "a system service".
+            with patch.object(theme_ai, "_socket_owner", return_value=(3, 0)):
+                self.assertIsNone(theme_ai._trusted_connection("127.0.0.1", port, 1.0))
+            with patch.object(theme_ai, "_socket_owner", return_value=None):
+                self.assertIsNone(theme_ai._trusted_connection("127.0.0.1", port, 1.0))
+            with patch("socket.socket", side_effect=OSError("no netlink")):
+                self.assertIsNone(theme_ai._socket_owner(2, ("127.0.0.1", port), ("127.0.0.1", 1)))
+        self.assertEqual(bytes(state["got"]), b"")
+        self.assertIsNone(theme_ai._trusted_connection("10.0.0.1", 80, 0.2))      # never off this machine
+        self.assertFalse(theme_ai._loopback_ip("192.168.1.2"))
+        self.assertTrue(theme_ai._loopback_ip("::ffff:127.0.0.1"))
+
+    def test_the_kernel_names_the_owner_of_another_accounts_server(self):
+        # Real evidence that the accepted socket carries its listener's owner: a system
+        # service's loopback port, when this machine has one (CUPS, systemd-resolved).
+        import socket
+        for host, port in (("127.0.0.1", 631), ("::1", 631), ("127.0.0.53", 53), ("127.0.0.54", 53)):
+            try:
+                conn = socket.create_connection((host, port), timeout=0.5)
+            except OSError:
+                continue
+            with conn:
+                local, peer = conn.getsockname(), conn.getpeername()
+                found = theme_ai._socket_owner(conn.family, peer[:2], local[:2])
+                self.assertIsNotNone(found)
+                self.assertNotEqual(found[1], os.getuid())
+            return
+        self.skipTest("no system service listens on loopback here")
+
+    def test_hostile_replies_stop_or_are_refused(self):
+        port, _ = self.server(self.chat_reply("x" * (theme_ai.MAX_ANSWER + 10)))
+        with self.assertRaises(RuntimeError):
+            theme_ai.ask_local(self.model(port), "p")                   # answer too long
+        port, _ = self.server(b"HTTP/1.1 200 OK\r\n\r\n" + b"x" * (theme_ai.LOCAL_ANSWER_REPLY_MAX + 1))
+        with self.assertRaises(RuntimeError):
+            theme_ai.ask_local(self.model(port), "p")                   # reply over the cap
+        port, _ = self.server(self.chat_reply("x", status=b"401 Unauthorized"))
+        with self.assertRaisesRegex(RuntimeError, "401"):
+            theme_ai.ask_local(self.model(port), "p")
+        port, _ = self.server(b"HTTP/1.1 200 OK\r\n\r\n{\"choices\": [{\"message\": {\"content\": 5}}]}")
+        with self.assertRaises(RuntimeError):
+            theme_ai.ask_local(self.model(port), "p")
+        port, _ = self.server(drip=[b"HTTP/1.1 200 OK\r\n"] + [b"X: y\r\n"] * 400, pause=0.05)
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            theme_ai.ask_local(self.model(port), "p", timeout=1)        # one deadline for it all
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_stop_ends_a_local_answer(self):
+        import threading
+        port, _ = self.server(drip=[b"HTTP/1.1 200 OK\r\n"] + [b"X: y\r\n"] * 400, pause=0.05)
+        run_id = theme_ai._new_run()
+        threading.Timer(0.3, theme_ai.cancel).start()
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            theme_ai.ask_local(self.model(port), "p", timeout=30, run_id=run_id)
+        self.assertLess(time.monotonic() - started, 3)
+
+
 class LocalModelTests(unittest.TestCase):
     """pi, Hermes and local models (2026-11-07, as in Maprisma Launcher)."""
 
@@ -717,35 +894,49 @@ class LocalModelTests(unittest.TestCase):
         self.assertNotIn("pi:llama-local/qwen-27b", states)                         # that is the "pi" entry
         self.assertFalse(states["claude"]["signed_in"])
 
-    def test_a_local_model_runs_offline_and_its_server_is_ensured(self):
-        seen = {}
-
-        class FakeProcess:
-            def __init__(self, argv, stdin=None, stdout=None, stderr=None, cwd=None, start_new_session=False, env=None,
-                         preexec_fn=None):
-                assert preexec_fn is theme_ai._limit_files          # every agent gets the file size cap
-                seen["argv"], self.returncode = argv, 0
-                stdout.write(b'{"candidates": []}')
-                stdout.flush()
-
-            def poll(self):
-                return 0
-
-            def wait(self):
-                return 0
+    def test_a_local_model_is_asked_by_theme_manager_itself_and_its_server_is_ensured(self):
+        # 2.6.12: no agent process connects to a local model any more (its listener could change
+        # after Theme Manager's check); Theme Manager sends the request over a checked connection.
+        asked = []
         with tempfile.TemporaryDirectory() as tmp:
             home = self.home(tmp)
             with patch.object(theme_ai.Path, "home", return_value=home), \
                     patch.object(theme_ai, "ensure_local_server") as ensure, \
-                    patch.object(theme_ai.subprocess, "Popen", FakeProcess):
+                    patch.object(theme_ai, "_port_open", return_value=False), \
+                    patch.object(theme_ai, "ask_local", side_effect=lambda m, p, **k: asked.append((m, p)) or "{}"), \
+                    patch.object(theme_ai.subprocess, "Popen", side_effect=AssertionError("an agent was started")):
                 theme_ai.run("pi:llama-local/gemma-4-12B", "hello")
-                self.assertEqual(seen["argv"][-5:], ["--offline", "--provider", "llama-local", "--model", "gemma-4-12B"])
                 self.assertEqual(ensure.call_args.args[0]["port"], 8080)
+                self.assertEqual((asked[-1][0]["model"], asked[-1][0]["path"], asked[-1][1]), ("gemma-4-12B", "/v1", "hello"))
                 with self.assertRaises(RuntimeError):
                     theme_ai.run("pi:cloud/big", "hello")            # only models pi lists as local
                 theme_ai.run("hermes", "hello")
                 self.assertEqual(ensure.call_args.args[0]["port"], 11434)
-                self.assertEqual(seen["argv"][:2], ["hermes", "chat"])
+                self.assertEqual(asked[-1][0]["model"], "qwen3:latest")
+                theme_ai.run("pi", "hello")                          # pi's default is local too
+                self.assertEqual(asked[-1][0]["model"], "qwen-27b")
+
+    def test_local_endpoints_and_keys(self):
+        self.assertEqual(theme_ai._local_endpoint("http://127.0.0.1:8080/v1/"), ("127.0.0.1", 8080, "/v1"))
+        self.assertEqual(theme_ai._local_endpoint("http://localhost:11434"), ("localhost", 11434, "/v1"))
+        for bad in ("https://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1?x=1", "http://u:p@127.0.0.1/v1",
+                    "http://127.0.0.1:8080/v 1", "http://127.0.0.1:8080/a\r\nX: y", "http://10.0.0.1/v1",
+                    "http://127.0.0.1:99999/v1", "http://127.0.0.1/%0d%0a"):
+            self.assertIsNone(theme_ai._local_endpoint(bad), bad)
+        self.assertEqual(theme_ai._api_key("local"), "local")
+        self.assertEqual(theme_ai._api_key("MY_KEY", {"MY_KEY": "sk-1"}), "sk-1")
+        for bad in ("!cat ~/.secret", "a b", "x\r\nHost: evil", "", None, 5, "k" * 600):
+            self.assertIsNone(theme_ai._api_key(bad), bad)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self.home(tmp)
+            conf = json.loads((home / ".pi/agent/models.json").read_text())
+            conf["providers"]["llama-local"]["apiKey"] = "local"
+            conf["providers"]["anthropic-proxy"] = {"baseUrl": "http://127.0.0.1:9000", "api": "anthropic-messages",
+                                                    "models": [{"id": "proxy-model"}]}
+            (home / ".pi/agent/models.json").write_text(json.dumps(conf))
+            pi = theme_ai.pi_models(home)
+        self.assertEqual({m["key"] for m in pi["local"]}, {"local"})
+        self.assertNotIn("proxy-model", [m["model"] for m in pi["local"]])     # an API Theme Manager cannot speak
 
     def test_local_server_is_started_by_its_unit(self):
         model = {"provider": "llama-local", "model": "m", "host": "127.0.0.1", "port": 8080}

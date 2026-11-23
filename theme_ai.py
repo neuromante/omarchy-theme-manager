@@ -7,6 +7,9 @@ or with a local model on this PC: every local chat model pi is connected to
 is a helper of its own, and Hermes counts as local when its default model is.
 Local models spend no tokens and nothing leaves the computer; their server is
 started (llama-server.service / ollama.service) when it is not running.
+Theme Manager asks a local model itself (ask_local: OpenAI-style chat over a
+loopback connection whose server end is proven yours or a system service's
+before anything is sent); pi and Hermes are only started for online models.
 The pattern is Maprisma Launcher's (docs/proposals/ask-ai.md there):
 
 - The agent has no tools (Claude Code, pi, Hermes), or (Codex: read-only
@@ -147,7 +150,7 @@ HELPERS["pi"] = {
     "name": "pi",
     # Maprisma's adapters/pi.toml [advise]: no tools, MCP servers, extensions
     # or project files; the prompt on stdin. Its model: pi's default, or a
-    # local one (pi:<provider>/<model>) with --offline --provider --model.
+    # local one (pi:<provider>/<model>) is asked by Theme Manager itself (ask_local).
     "argv": ["pi", "-p", "--no-session", "--no-tools", "--no-mcp", "--no-extensions",
              "--no-context-files", "--no-approve"],
     "stdin": True,
@@ -190,14 +193,42 @@ def _read_config(path: Path) -> bytes | None:
         os.close(fd)
 
 
+BASE_PATH_RE = re.compile(r"^(/[A-Za-z0-9._~-]{1,64}){0,4}$")
+API_KEY_RE = re.compile(r"^[\x21-\x7e]{1,512}$")       # one header value: printable, no spaces or line breaks
+OPENAI_APIS = (None, "openai-completions")         # pi provider APIs Theme Manager can speak itself
+
+
 def _local_url(value) -> tuple[str, int] | None:
+    where = _local_endpoint(value)
+    return where[:2] if where else None
+
+
+def _local_endpoint(value) -> tuple[str, int, str] | None:
+    """(host, port, base path) of a plain-http URL on this PC, or None."""
     from urllib.parse import urlsplit
     try:
         url = urlsplit(str(value or ""))
         port = url.port or (443 if url.scheme == "https" else 80)
     except ValueError:
         return None
-    return (url.hostname, port) if url.hostname in LOCAL_HOSTS else None
+    if url.hostname not in LOCAL_HOSTS or url.scheme != "http" or url.query or url.fragment or \
+            url.username is not None or url.password is not None:
+        return None
+    path = url.path.rstrip("/")
+    if not BASE_PATH_RE.match(path):
+        return None
+    return url.hostname, port, path or "/v1"
+
+
+def _api_key(value, environ=None) -> str | None:
+    """pi's apiKey of a local provider: the variable it names when that is set,
+    else the text itself. A command ("!…") is never run (no key then)."""
+    environ = os.environ if environ is None else environ
+    if not isinstance(value, str) or not value or value.startswith("!"):
+        return None
+    if re.match(r"^[A-Z_][A-Z0-9_]*$", value) and environ.get(value):
+        value = environ[value]
+    return value if API_KEY_RE.match(value) else None
 
 
 def pi_models(home: Path | None = None) -> dict:
@@ -216,16 +247,18 @@ def pi_models(home: Path | None = None) -> dict:
     for provider, conf in (providers.items() if isinstance(providers, dict) else ()):
         if not isinstance(conf, dict) or not NAME_RE.match(str(provider)):
             continue
-        where = _local_url(conf.get("baseUrl"))
-        if where is None:
-            continue
+        where = _local_endpoint(conf.get("baseUrl"))
+        if where is None or conf.get("api") not in OPENAI_APIS:
+            continue                    # only an OpenAI-style chat server Theme Manager can ask itself
+        key = _api_key(conf.get("apiKey"))
         seen = set()
         for model in conf.get("models") or []:
             ident = str(model.get("id") or "") if isinstance(model, dict) else str(model)
             if not NAME_RE.match(ident) or NOT_CHAT.search(ident) or ident in seen:
                 continue
             seen.add(ident)
-            local.append({"provider": str(provider), "model": ident, "host": where[0], "port": where[1]})
+            local.append({"provider": str(provider), "model": ident, "host": where[0], "port": where[1],
+                          "path": where[2], "key": key})
     settings = read("settings.json") or {}
     provider, model = settings.get("defaultProvider"), settings.get("defaultModel")
     return {"local": local[:40],
@@ -265,8 +298,9 @@ def hermes_model(home: Path | None = None) -> dict:
         path.append((indent, key))
     if not model or not NAME_RE.match(model):
         return {"model": None, "local": None}
-    where = _local_url(apis.get(provider)) if provider and NAME_RE.match(provider) else None
-    local = {"provider": provider, "model": model, "host": where[0], "port": where[1]} if where else None
+    where = _local_endpoint(apis.get(provider)) if provider and NAME_RE.match(provider) else None
+    local = {"provider": provider, "model": model, "host": where[0], "port": where[1],
+             "path": where[2], "key": None} if where else None
     return {"model": model, "local": local}
 
 
@@ -408,34 +442,155 @@ LOCAL_REPLY_MAX = 1024 * 1024     # bytes of a model server's reply
 LOCAL_DEADLINE = 3.0              # seconds for one whole request, connect to last byte
 
 
-def _http_json(method: str, host: str, port: int, path: str, body=None, timeout: float = LOCAL_DEADLINE):
-    """One small JSON request to a loopback server (HTTP/1.0, one deadline for
-    the whole exchange, the reply capped); None on any failure."""
+TCP_ESTABLISHED = 1
+PEER_SETTLE = 0.5                 # seconds to wait for the server's side of a fresh connection
+
+
+def _loopback_ip(address: str) -> bool:
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_loopback
+
+
+def _socket_owner(family: int, src: tuple, dst: tuple):
+    """(state, owner uid) of the one TCP socket on this machine whose local end
+    is `src` and remote end `dst` ((ip, port) pairs), asked from the kernel over
+    netlink sock_diag as an exact lookup (no dump); None when there is none or
+    the answer is not exactly that socket."""
+    import socket
+    import struct
+    try:
+        raw_src, raw_dst = socket.inet_pton(family, src[0]), socket.inet_pton(family, dst[0])
+    except (OSError, ValueError):
+        return None
+    addresses = struct.pack("!HH", src[1], dst[1]) + raw_src.ljust(16, b"\0") + raw_dst.ljust(16, b"\0")
+    for interface in (0, _lo_index()):                                     # a server bound to `lo` needs its index
+        if interface is None:
+            continue
+        found = _socket_owner_on(family, addresses, interface)
+        if found is not None:
+            return found
+    return None
+
+
+def _lo_index():
+    import socket
+    try:
+        return socket.if_nametoindex("lo")
+    except OSError:
+        return None
+
+
+def _socket_owner_on(family: int, addresses: bytes, interface: int):
+    import socket
+    import struct
+    sockid = addresses + struct.pack("=III", interface, 0xFFFFFFFF, 0xFFFFFFFF)   # INET_DIAG_NOCOOKIE
+    request = struct.pack("=BBBxI", family, socket.IPPROTO_TCP, 0, 0xFFFFFFFF) + sockid
+    header = struct.pack("=IHHII", 16 + len(request), 20, 0x1, 1, 0)      # SOCK_DIAG_BY_FAMILY, REQUEST only
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 4)      # NETLINK_SOCK_DIAG
+    except OSError:
+        return None
+    with sock:
+        try:
+            sock.settimeout(NETLINK_DEADLINE)
+            sock.sendto(header + request, (0, 0))
+            data = sock.recv(65536)
+        except OSError:
+            return None
+    if len(data) < 16 + 72:
+        return None                                                        # an error (no such socket) or short
+    length, kind, _flags, seq, _pid = struct.unpack_from("=IHHII", data, 0)
+    if kind != 20 or seq != 1 or length < 16 + 72 or length > len(data):
+        return None
+    msg = 16
+    if data[msg] != family or data[msg + 4:msg + 4 + 36] != addresses:
+        return None                                                        # not the socket asked for
+    return data[msg + 1], struct.unpack_from("=I", data, msg + 64)[0]
+
+
+def _peer_is_trusted(sock) -> bool:
+    """Whether the server's end of this connected loopback socket belongs to
+    you or a system service. The kernel gives an accepted socket the owner of
+    the listening socket it came from, so this binds the trust decision to the
+    very connection that is used: a listener that went away and was replaced
+    by another account's after any earlier check is caught here, before a byte
+    is sent. Only a full (ESTABLISHED) server socket counts; the kernel reports
+    a half-open one without an owner."""
+    try:
+        local, peer = sock.getsockname(), sock.getpeername()
+    except OSError:
+        return False
+    if not _loopback_ip(peer[0]) or not _loopback_ip(local[0]):
+        return False
+    mine, deadline = os.getuid(), time.monotonic() + PEER_SETTLE
+    while True:
+        found = _socket_owner(sock.family, (peer[0], peer[1]), (local[0], local[1]))
+        if found is not None and found[0] == TCP_ESTABLISHED:
+            return found[1] == mine or found[1] <= SYSTEM_UID_MAX
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _trusted_connection(host: str, port: int, timeout: float):
+    """A TCP connection to a loopback server whose other end is proven yours
+    (or a system service's), or None. Nothing is sent before that proof."""
     import socket
     if host not in LOOPBACK or type(port) is not int or not 0 < port < 65536:
         return None
-    if port_is_trusted(port) is not True:
-        return None                    # nobody, or another person's account, listens there
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return None
+    if not _peer_is_trusted(sock):
+        sock.close()
+        return None
+    return sock
+
+
+def _http_request(method: str, host: str, port: int, path: str, body=None, timeout: float = LOCAL_DEADLINE,
+                  cap: int = LOCAL_REPLY_MAX, headers: dict | None = None, cancelled=None):
+    """One HTTP/1.0 exchange with a loopback server over a connection checked
+    by _trusted_connection: one deadline for the whole exchange, the reply
+    capped, `cancelled()` asked between reads. (status, body) or None."""
+    import socket
+    if host not in LOOPBACK or type(port) is not int or not 0 < port < 65536:
+        return None
     deadline = time.monotonic() + timeout
     data = json.dumps(body).encode() if body is not None else b""
-    request = (f"{method} {path} HTTP/1.0\r\nHost: {host}\r\nAccept: application/json\r\n"
+    extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
+    request = (f"{method} {path} HTTP/1.0\r\nHost: {host}\r\nAccept: application/json\r\n" + extra
                + (f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n" if body is not None else "")
                + "Connection: close\r\n\r\n").encode() + data
     reply = bytearray()
+    sock = _trusted_connection(host, port, min(timeout, LOCAL_DEADLINE))
+    if sock is None:
+        return None                    # nobody, or another person's account, at the other end
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
+        with sock:
             sock.settimeout(max(0.05, deadline - time.monotonic()))
             sock.sendall(request)
             while True:
+                if cancelled is not None and cancelled():
+                    return None
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return None
-                sock.settimeout(left)
-                chunk = sock.recv(65536)
+                sock.settimeout(min(left, 0.25))
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    continue
                 if not chunk:
                     break
                 reply += chunk
-                if len(reply) > LOCAL_REPLY_MAX:
+                if len(reply) > cap:
                     return None
     except OSError:
         return None
@@ -444,14 +599,27 @@ def _http_json(method: str, host: str, port: int, path: str, body=None, timeout:
         return None
     lines = head.split(b"\r\n")
     parts = lines[0].split(b" ", 2)
-    if len(parts) < 2 or not parts[0].startswith(b"HTTP/1.") or not parts[1].isdigit() or int(parts[1]) >= 300:
+    if len(parts) < 2 or not parts[0].startswith(b"HTTP/1.") or not parts[1].isdigit():
         return None
     if any(line.lower().startswith(b"transfer-encoding:") and b"chunked" in line.lower() for line in lines[1:]):
         payload = _unchunk(payload)
         if payload is None:
             return None
+    return int(parts[1]), payload
+
+
+def _http_json(method: str, host: str, port: int, path: str, body=None, timeout: float = LOCAL_DEADLINE):
+    """One small JSON request to a loopback server (HTTP/1.0, one deadline for
+    the whole exchange, the reply capped); None on any failure."""
+    if host not in LOOPBACK or type(port) is not int or not 0 < port < 65536:
+        return None
+    if port_is_trusted(port) is not True:
+        return None                    # quick refusal; the connection itself is checked again
+    answer = _http_request(method, host, port, path, body, timeout)
+    if answer is None or answer[0] >= 300:
+        return None
     try:
-        return json.loads(payload) if payload.strip() else {}
+        return json.loads(answer[1]) if answer[1].strip() else {}
     except ValueError:
         return None
 
@@ -990,14 +1158,53 @@ def run(helper_id: str, prompt: str, timeout: int = TIMEOUT, web: bool = False) 
         except RuntimeError:
             remember_loaded(local, before)      # nothing loaded: the claim goes again
             raise
-        if base == "pi":
-            extra = ["--offline", "--provider", local["provider"], "--model", local["model"]]
-    try:
-        return _run_helper(helper, argv_extra=extra, prompt=prompt, timeout=timeout,
-                           web=web and helper.get("web") is not None, run_id=run_id)
-    finally:
-        if local is not None:
+        # Theme Manager asks a local model itself, over one connection whose other end is
+        # proven yours (or a system service's) before the prompt is sent. pi or Hermes would
+        # connect on their own, to a port whose listener could change after any check here.
+        try:
+            return ask_local(local, prompt, timeout=timeout, run_id=run_id)
+        finally:
             remember_loaded(local, before)
+    return _run_helper(helper, argv_extra=extra, prompt=prompt, timeout=timeout,
+                       web=web and helper.get("web") is not None, run_id=run_id)
+
+
+LOCAL_ANSWER_REPLY_MAX = 4 * MAX_ANSWER     # bytes of a chat reply (JSON escaping makes text longer)
+LOCAL_MAX_TOKENS = 8192
+
+
+def ask_local(model: dict, prompt: str, timeout: int = TIMEOUT, run_id: int | None = None) -> str:
+    """One answer from a local OpenAI-style chat server (llama.cpp, Ollama's /v1):
+    POST <base>/chat/completions over _http_request (the server's end checked
+    before anything is sent, one deadline, the reply capped, Stop honoured).
+    Raises RuntimeError with a short reason."""
+    if run_id is None:
+        run_id = _new_run()
+    headers = {}
+    if model.get("key"):
+        headers["Authorization"] = f"Bearer {model['key']}"
+    body = {"model": model["model"], "messages": [{"role": "user", "content": prompt}],
+            "stream": False, "max_tokens": LOCAL_MAX_TOKENS}
+    answer = _http_request("POST", model["host"], model["port"], f"{model.get('path') or '/v1'}/chat/completions",
+                           body, timeout=timeout, cap=LOCAL_ANSWER_REPLY_MAX, headers=headers,
+                           cancelled=lambda: _is_cancelled(run_id))
+    if _is_cancelled(run_id):
+        raise RuntimeError("cancelled")
+    if answer is None:
+        raise RuntimeError(f"no answer from the local model server on port {model['port']}")
+    status, payload = answer
+    if status >= 300:
+        raise RuntimeError(f"the local model server answered {status}")
+    try:
+        reply = json.loads(payload)
+        text = reply["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise RuntimeError("the local model's answer could not be read") from None
+    if not isinstance(text, str):
+        raise RuntimeError("the local model's answer could not be read")
+    if len(text.encode("utf-8", "replace")) > MAX_ANSWER:
+        raise RuntimeError("the answer is too long")
+    return text
 
 
 def local_model(helper_id: str | None) -> dict | None:

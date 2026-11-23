@@ -286,7 +286,8 @@ class WebToolTests(unittest.TestCase):
         def fake_run(helper, argv_extra, prompt, timeout, web=False, run_id=None):
             seen.update(web=web, prompt=prompt)
             return '{"summary": "s", "queries": ["snow"], "images": [{"url": "https://img.example.com/a.jpg"}]}'
-        with patch.object(theme_ai, "_run_helper", fake_run):
+        # pi as an online agent here (a local default would be asked by Theme Manager itself).
+        with patch.object(theme_ai, "_run_helper", fake_run), patch.object(theme_ai, "local_model", return_value=None):
             summary, queries, images = theme_ai.ask_wallpapers("claude", "snow", "Nord", COLORS, web=True)
             self.assertTrue(seen["web"])
             self.assertEqual((queries, [i["url"] for i in images]), (["snow"], ["https://img.example.com/a.jpg"]))

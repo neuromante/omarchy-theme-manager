@@ -20,15 +20,22 @@ cannot be reused meanwhile.
 If the supervisor itself dies, even by SIGKILL (Quickshell kills a running Process when the
 shell exits), a small watchdog ends the group at once. It is forked *before* the program starts
 (no watchdog, no program), sits in a session of its own, and gets from the program itself, between
-fork and exec, a pidfd of the program (SCM_RIGHTS), so it holds the program's identity even if the
-supervisor dies right after the start. It then waits on a pipe whose only writer is the
-supervisor. When that pipe closes without the supervisor's "done", it sends SIGTERM to the whole
-group through that pidfd (PIDFD_SIGNAL_PROCESS_GROUP, Linux 6.9+: the group is the program's own,
-never a later group that reused the number; it reaches the members also after the program
-itself exited and was reaped, since the kernel keeps the group's identity while any member is
-left), waits the grace period, then sends SIGKILL the same way. On an older kernel it falls back to the group number only while the program itself is still
-unreaped (checked through the same pidfd). The program also gets SIGTERM directly
-(PR_SET_PDEATHSIG).
+fork and exec, its group id (the program's pid) and a pidfd of the program (SCM_RIGHTS) in one
+message, so it holds the group's identity even if the supervisor dies right after the start and
+the program exits and is reaped (by init) before the watchdog reads that message. It then waits
+on a pipe whose only writer is the supervisor. When that pipe closes without the supervisor's
+"done", it sends SIGTERM to the whole group through that pidfd (PIDFD_SIGNAL_PROCESS_GROUP, Linux
+6.9+: the group is the program's own, never a later group that reused the number; it reaches the
+members also after the program itself exited and was reaped, since the kernel keeps the group's
+identity while any member is left), waits the grace period, then sends SIGKILL the same way. On
+an older kernel it falls back to the group number, and only while that number is provably still
+this group's (the program is unreaped, or a live process is still in the group, which keeps the
+number from being given out again). The program also gets SIGTERM directly (PR_SET_PDEATHSIG).
+
+The supervisor writes "done" only after it has ended the group *and* found it empty (no live
+member left; the program itself is still unreaped then, so the number is still its group's). A
+supervisor that dies at any point before that leaves the cleanup to the watchdog, and a watchdog
+that gets "done" checks the group once more and ends it itself if anything is left.
 
 With ``--report-start`` the supervisor prints the line ``bounded_run: started`` on stdout once
 the program has really been started (exec succeeded), so the caller can tell a started helper
@@ -51,6 +58,7 @@ import sys
 import time
 
 GRACE = 5.0          # seconds between SIGTERM and SIGKILL to the group
+KILL_WAIT = 2.0      # seconds after the SIGKILL for the group to be found empty
 MAX_SECONDS = 3600.0
 PR_SET_PDEATHSIG = 1
 PIDFD_SIGNAL_PROCESS_GROUP = 4   # linux/pidfd.h, Linux 6.9+
@@ -118,6 +126,17 @@ def end_group(pgid: int, grace: float = GRACE) -> None:
     _killpg(pgid, signal.SIGKILL)
 
 
+def wait_group_empty(pgid: int, seconds: float) -> bool:
+    """True once no live process is left in the group (within ``seconds``)."""
+    deadline = time.monotonic() + seconds
+    while True:
+        if not group_members(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
 def _read_exact(fd: int, size: int) -> bytes:
     data = b""
     while len(data) < size:
@@ -146,36 +165,75 @@ def _pidfd_pid(pidfd: int) -> int | None:
     return None
 
 
+INFO_MAX = 32       # bytes of the program's message to the watchdog: b"p" + its pid
+
+
+def _parse_info(msg: bytes) -> int | None:
+    """The group id in the program's message (b"p<pid>"), or None."""
+    if not msg.startswith(b"p") or not msg[1:].isdigit() or len(msg) > 12:
+        return None
+    pid = int(msg[1:])
+    return pid if pid > 1 else None
+
+
 def watchdog(info_sock, alive_r: int, grace: float = GRACE) -> None:
     """The watchdog's work, armed before the program starts.
 
-    info_sock: between fork and exec the program opens a pidfd of *itself* and passes it here
-    (SCM_RIGHTS), so the watchdog holds the program's identity even if the supervisor dies right
-    after the start, and a reused pid number can never stand in for it. alive_r: only the
-    supervisor writes here; "d" means it ended the group itself, EOF without it means the
-    supervisor died."""
+    info_sock: between fork and exec the program sends its own pid (= its group id) and a pidfd
+    of *itself* here (SCM_RIGHTS), so the watchdog holds the group's identity even if the
+    supervisor dies right after the start and the program is reaped before this message is read,
+    and a reused pid number can never stand in for it. alive_r: only the supervisor writes here;
+    "d" means it ended the group itself and found it empty, EOF without it means the supervisor
+    died."""
     import socket
     try:
-        _msg, fds, _flags, _addr = socket.recv_fds(info_sock, 1, 1)
+        msg, fds, _flags, _addr = socket.recv_fds(info_sock, INFO_MAX, 1)
     except OSError:
-        fds = []
+        msg, fds = b"", []
     info_sock.close()
     if len(fds) != 1:
+        for fd in fds:
+            os.close(fd)
         return                        # the program never started
     pidfd = fds[0]
-    pgid = _pidfd_pid(pidfd)
+    pgid = _parse_info(msg)
+    known = _pidfd_pid(pidfd)        # the kernel's word while the program is not reaped yet
+    if known is not None:
+        pgid = known
     if pgid is None:
+        # No group id at all (cannot happen with our own program): the pidfd path still works.
+        pgid = -1
+    if _read_exact(alive_r, 1) == b"d" and not _group_left(pidfd, pgid, zombies_count=False):
         return
-    if _read_exact(alive_r, 1) == b"d":
-        return
+    end_group_by_pidfd(pidfd, pgid, grace)
+
+
+def end_group_by_pidfd(pidfd: int, pgid: int, grace: float = GRACE) -> None:
+    """SIGTERM the program's own group, wait up to ``grace`` for it to empty, SIGKILL the rest."""
     if not _group_signal(pidfd, pgid, signal.SIGTERM):
         return
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
-        if not group_members(pgid):
+        if not _group_left(pidfd, pgid):
             return
         time.sleep(0.05)
     _group_signal(pidfd, pgid, signal.SIGKILL)
+
+
+def _group_left(pidfd: int, pgid: int, zombies_count: bool = True) -> bool:
+    """Whether the program's group still has a member. Through the pidfd (exact, zombies
+    included) where the kernel can tell; by number (live members only) otherwise or when
+    zombies are not to count."""
+    if zombies_count:
+        try:
+            signal.pidfd_send_signal(pidfd, 0, None, PIDFD_SIGNAL_PROCESS_GROUP)
+        except ProcessLookupError:
+            return False
+        except (OSError, TypeError):
+            pass
+        else:
+            return bool(group_members(pgid)) if pgid > 1 else True
+    return pgid > 1 and bool(group_members(pgid))
 
 
 def _group_signal(pidfd: int, pgid: int, sig: int) -> bool:
@@ -188,11 +246,15 @@ def _group_signal(pidfd: int, pgid: int, sig: int) -> bool:
     except (OSError, TypeError):
         pass
     # Kernel without process-group pidfd signals: the group number is still the program's own
-    # only while the program itself (its leader, held by this pidfd) has not been reaped.
+    # while the program itself (its leader, held by this pidfd) has not been reaped, or while a
+    # live process is still in that group (a number in use as a group id is not given out again).
+    if pgid <= 1:
+        return False
     try:
         signal.pidfd_send_signal(pidfd, 0)
     except OSError:
-        return False
+        if not group_members(pgid):
+            return False
     _killpg(pgid, sig)
     return True
 
@@ -250,12 +312,17 @@ def _child_setup(parent: int, info_sock):
             pass
         if os.getppid() != parent:
             raise _NotStarted("supervisor gone")
+        if os.getpgid(0) != os.getpid():
+            raise _NotStarted("not the leader of a group of its own")
         # Hand the watchdog a pidfd of this very process (close-on-exec, so the program never
         # holds it). Without it the watchdog could not end this group: do not start. Raising
         # here makes Popen fail (no exec, no start line).
+        # Its pid (the group id: start_new_session made it the leader) goes in the same message,
+        # so the watchdog knows the group even if it reads this only after the program was reaped.
         own = os.pidfd_open(os.getpid())
+        message = b"p%d" % os.getpid()
         try:
-            if socket.send_fds(info_sock, [b"p"], [own]) != 1:
+            if socket.send_fds(info_sock, [message], [own]) != len(message):
                 raise _NotStarted("watchdog not told")
         finally:
             os.close(own)
@@ -336,10 +403,13 @@ def run(seconds: float, argv: list[str], grace: float = GRACE, report_start: boo
             time.sleep(wait_ms / 1000)
 
     end_group(pgid, grace)
-    try:
-        os.write(watch_w, b"d")
-    except OSError:
-        pass
+    # "done" only once the group is provably empty (the leader is still unreaped, so the number
+    # is still this group's). Otherwise the pipe just closes and the watchdog ends what is left.
+    if wait_group_empty(pgid, KILL_WAIT):
+        try:
+            os.write(watch_w, b"d")
+        except OSError:
+            pass
     os.close(watch_w)
     _reap(watcher)
     if pidfd >= 0:
