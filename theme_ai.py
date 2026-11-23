@@ -268,12 +268,14 @@ def pi_models(home: Path | None = None) -> dict:
 
 def hermes_model(home: Path | None = None) -> dict:
     """Hermes's default model (~/.hermes/config.yaml, a few YAML lines read by
-    indentation) and, when it runs on this PC, where: {model, local}."""
+    indentation) and, when it runs on this PC, where: {model, local, urls}.
+    urls: every value under `model:`, under the default provider's entry and
+    under a fallback section, for agent_endpoints()."""
     data = _read_config((home or Path.home()) / ".hermes/config.yaml")
     if not data:
-        return {"model": None, "local": None}
-    model = provider = None
-    apis, path = {}, []
+        return {"model": None, "local": None, "urls": []}
+    model = provider = base_url = None
+    apis, path, values = {}, [], []
     for raw in data.decode("utf-8", "replace").split("\n"):
         line = raw.replace("\t", " " * 8)
         match = re.match(r"^(\s*)([A-Za-z0-9_.-]+):\s*(.*?)\s*$", line)
@@ -293,15 +295,103 @@ def hermes_model(home: Path | None = None) -> dict:
                 model = value
             elif key == "provider":
                 provider = value
-        elif len(parents) == 2 and parents[0] == "providers" and key == "api":
-            apis[parents[1]] = value
+            elif key == "base_url":
+                base_url = value
+        elif len(parents) == 2 and parents[0] == "providers" and key in ("api", "base_url"):
+            apis.setdefault(parents[1], value)
+        if value:
+            values.append((parents + [key], value))
         path.append((indent, key))
+    urls = [value for keys, value in values
+            if keys[0] == "model" or "fallback" in keys[0] or keys[:2] == ["providers", provider]]
     if not model or not NAME_RE.match(model):
-        return {"model": None, "local": None}
-    where = _local_endpoint(apis.get(provider)) if provider and NAME_RE.match(provider) else None
+        return {"model": None, "local": None, "urls": urls}
+    endpoint = base_url or (apis.get(provider) if provider and NAME_RE.match(provider) else None)
+    where = _local_endpoint(endpoint)
     local = {"provider": provider, "model": model, "host": where[0], "port": where[1],
              "path": where[2], "key": None} if where else None
-    return {"model": model, "local": local}
+    return {"model": model, "local": local, "urls": urls}
+
+
+def _on_this_machine(host) -> bool:
+    """Whether a URL host names this PC (where another local account could
+    hold the port): localhost names, this host's name, loopback or unspecified
+    addresses, and addresses of this PC's own interfaces."""
+    import ipaddress
+    import socket
+    name = str(host or "").strip("[]").rstrip(".").lower()
+    if not name:
+        return False
+    if name == "localhost" or name.endswith(".localhost") or name == socket.gethostname().lower():
+        return True
+    try:
+        ip = ipaddress.ip_address(name.split("%", 1)[0])
+    except ValueError:
+        return False                    # another host name: not resolved here (see README)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_loopback or ip.is_unspecified:
+        return True
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.bind((str(ip), 0))    # only an address of this PC can be bound
+        return True
+    except OSError:
+        return False
+
+
+def _url_on_this_machine(value) -> bool:
+    from urllib.parse import urlsplit
+    if not isinstance(value, str) or "//" not in value:
+        return False
+    try:
+        return _on_this_machine(urlsplit(value.strip()).hostname)
+    except ValueError:
+        return True                     # an address that cannot be read: not trusted
+
+
+def agent_endpoints(base: str, home: Path | None = None) -> list[str]:
+    """The model addresses an agent would connect to by itself, from its own
+    configuration: pi's default provider, Hermes's default model (and
+    fallbacks), Claude Code's ANTHROPIC_BASE_URL in ~/.claude/settings.json.
+    (Codex runs in its jail with only its sign-in file: no config.toml.)"""
+    home = home or Path.home()
+    urls = []
+    if base == "pi":
+        def read(name):
+            data = _read_config(home / ".pi/agent" / name)
+            try:
+                value = json.loads(data) if data else None
+            except ValueError:
+                return None
+            return value if isinstance(value, dict) else None
+        provider = (read("settings.json") or {}).get("defaultProvider")
+        providers = (read("models.json") or {}).get("providers")
+        conf = providers.get(provider) if isinstance(providers, dict) and isinstance(provider, str) else None
+        if isinstance(conf, dict):
+            urls.append(conf.get("baseUrl"))
+    elif base == "hermes":
+        urls += hermes_model(home)["urls"]
+    elif base == "claude":
+        data = _read_config(home / ".claude/settings.json")
+        try:
+            env = (json.loads(data) if data else {}).get("env")
+        except (ValueError, AttributeError):
+            env = None
+        if isinstance(env, dict):
+            urls += [env.get(k) for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL")]
+    return [u for u in urls if isinstance(u, str) and u]
+
+
+def refuse_local_agent(base: str, home: Path | None = None) -> None:
+    """An agent whose own model address is on this PC is never started: it
+    would connect by itself to a port whose listener Theme Manager cannot
+    bind its check to. (Theme Manager asks the local models it can speak to
+    itself, through ask_local.)"""
+    if any(_url_on_this_machine(url) for url in agent_endpoints(base, home)):
+        raise RuntimeError("this helper's model server is on this PC and cannot be checked: "
+                           "choose its local model entry instead")
 
 
 def local_helper_id(model: dict) -> str:
@@ -1165,6 +1255,7 @@ def run(helper_id: str, prompt: str, timeout: int = TIMEOUT, web: bool = False) 
             return ask_local(local, prompt, timeout=timeout, run_id=run_id)
         finally:
             remember_loaded(local, before)
+    refuse_local_agent(base)
     return _run_helper(helper, argv_extra=extra, prompt=prompt, timeout=timeout,
                        web=web and helper.get("web") is not None, run_id=run_id)
 

@@ -938,6 +938,50 @@ class LocalModelTests(unittest.TestCase):
         self.assertEqual({m["key"] for m in pi["local"]}, {"local"})
         self.assertNotIn("proxy-model", [m["model"] for m in pi["local"]])     # an API Theme Manager cannot speak
 
+    def test_an_agent_whose_own_model_is_on_this_pc_is_never_started(self):
+        # Codex round 1 on 2.6.12: pi's default provider on localhost with an API Theme Manager
+        # does not speak would have made pi connect by itself to an unchecked port.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = self.home(tmp)
+            conf = json.loads((home / ".pi/agent/models.json").read_text())
+            conf["providers"]["proxy"] = {"baseUrl": "http://127.0.0.2:9000", "api": "anthropic-messages",
+                                          "models": [{"id": "pm"}]}
+            (home / ".pi/agent/models.json").write_text(json.dumps(conf))
+            (home / ".pi/agent/settings.json").write_text(json.dumps({"defaultProvider": "proxy", "defaultModel": "pm"}))
+            (home / ".hermes/config.yaml").write_text(
+                "model:\n  default: big\n  provider: odd\nproviders:\n  odd:\n    api: https://localhost:8443/v1\n")
+            (home / ".claude").mkdir()
+            (home / ".claude/settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://[::1]:4000"}}))
+            with patch.object(theme_ai.Path, "home", return_value=home), \
+                    patch.object(theme_ai, "_run_helper", side_effect=AssertionError("an agent was started")):
+                for helper in ("pi", "hermes", "claude"):
+                    with self.assertRaisesRegex(RuntimeError, "on this PC"):
+                        theme_ai.run(helper, "hello")
+            # Online addresses still run the agent.
+            (home / ".claude/settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.example.com"}}))
+            (home / ".hermes/config.yaml").write_text(
+                "model:\n  default: big\n  provider: cloud\nproviders:\n  cloud:\n    api: https://api.example.com/v1\n"
+                "fallback_model:\n  base_url: http://0.0.0.0:11434/v1\n")
+            with patch.object(theme_ai.Path, "home", return_value=home), \
+                    patch.object(theme_ai, "_run_helper", return_value="{}") as ran:
+                theme_ai.run("claude", "hello")
+                self.assertEqual(ran.call_count, 1)
+                with self.assertRaisesRegex(RuntimeError, "on this PC"):
+                    theme_ai.run("hermes", "hello")                    # its fallback is on this PC
+            # Hermes with a local model.base_url is asked directly.
+            (home / ".hermes/config.yaml").write_text(
+                "model:\n  default: q3\n  provider: custom\n  base_url: http://localhost:11434/v1\n")
+            self.assertEqual(theme_ai.hermes_model(home)["local"]["port"], 11434)
+
+    def test_what_counts_as_this_pc(self):
+        for host in ("localhost", "LOCALHOST.", "x.localhost", "127.0.0.2", "0.0.0.0", "::", "::1",
+                     "::ffff:127.0.0.1", "[::1]"):
+            self.assertTrue(theme_ai._on_this_machine(host), host)
+        for host in ("8.8.8.8", "api.example.com", "", None, "2001:db8::1"):
+            self.assertFalse(theme_ai._on_this_machine(host), host)
+        self.assertTrue(theme_ai._url_on_this_machine("http://[::1"))          # unreadable: not trusted
+        self.assertFalse(theme_ai._url_on_this_machine("qwen3:latest"))
+
     def test_local_server_is_started_by_its_unit(self):
         model = {"provider": "llama-local", "model": "m", "host": "127.0.0.1", "port": 8080}
         answers = iter([False, False, True])
