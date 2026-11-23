@@ -2870,6 +2870,52 @@ class ViewLayerTest(unittest.TestCase):
             self.spin_until_released(released)
         self.assertEqual(done, [None])
 
+    def test_a_failing_call_releases_what_its_traceback_holds_on_gtks_thread(self):
+        released, results = [], []
+
+        def broken(w=self.Witness(released)):
+            held = w            # in the frame the traceback keeps
+            raise ValueError("no")
+        theme_popup.run_off_main_loop(broken, lambda result, error: results.append(type(error)))
+        broken.__defaults__ = None   # the traceback's frame is now the last holder
+        self.spin_until_released(released)
+        self.assertEqual(results, [ValueError])
+
+    def test_any_failing_settings_write_is_reported_and_the_queue_goes_on(self):
+        done, notes = [], []
+        self.app.INLINE_WORKERS = False
+
+        def broken():
+            raise TypeError("unhashable type: 'list'")   # as from a damaged "language": []
+        with patch.object(theme_popup.theme_core, "notify", lambda title, body: notes.append(body)), \
+                patch.object(theme_popup.theme_auto, "update_settings", lambda **_values: None):
+            self.app._save_in_background(broken, then=lambda: done.append("first"))
+            self.app._save_in_background({"x": 1}, then=lambda: done.append("second"))
+            self.assertTrue(self.pump_until(lambda: len(done) == 2, 5))
+        self.assertEqual(done, ["first", "second"])
+        self.assertEqual(notes, ["unhashable type: 'list'"])
+
+    def test_a_decode_that_raises_counts_as_failed_and_the_decoder_goes_on(self):
+        called = []
+        real = theme_popup.scaled_pixbuf
+        calls = iter([RuntimeError("loader broke"), None])
+
+        def flaky(*_args):
+            outcome = next(calls)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return real(*_args)
+        path = Path(self.tmp.name) / "after.png"
+        path.write_bytes(PNG)
+        decoder = theme_popup.ImageDecoder(1)
+        with patch.object(theme_popup, "scaled_pixbuf", flaky):
+            decoder.request(None, path, 16, 9, setter=lambda t: called.append("set"),
+                            failed=lambda: called.append("failed"))
+            decoder.request(None, path, 16, 9, setter=lambda t: called.append("set"),
+                            failed=lambda: called.append("failed"))
+            self.assertTrue(self.pump_until(lambda: len(called) == 2, 5))
+        self.assertEqual(called, ["failed", "set"])
+
     def test_cycles_are_collected_only_on_gtks_loop(self):
         import gc
         was_enabled = gc.isenabled()

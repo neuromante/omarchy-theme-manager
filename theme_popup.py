@@ -905,20 +905,31 @@ class BackgroundNotSet(Exception):
     """A pinned theme was applied, but its wallpaper could not be set."""
 
 
+def outcome_of(fn):
+    """`(fn(), None)`, or `(None, error)` when it raised. The error's traceback holds the frames
+    of `fn`, and with them whatever widgets `fn` used, so it must travel like a widget does."""
+    try:
+        return fn(), None
+    except Exception as exc:  # noqa: BLE001 - every job reports instead of ending its worker
+        return None, exc
+
+
+# Handing work to a thread and back: GTK is not thread-safe, so a widget must never be released
+# (disposed) on a worker. The job travels in a list, the "box", and the worker appends the job's
+# outcome (result or error, whose traceback may hold widgets too) to the same box. The worker keeps
+# no reference of its own, and only the main loop empties the box, so whatever is in it is
+# always released on GTK's thread.
+
 def run_off_main_loop(fn, on_done):
     """Run the blocking `fn()` on a worker thread, then `on_done(result, error)` once on the main
-    loop. Both callables usually hold widgets, so they travel in a box that only the main loop
-    empties: the worker never holds the last reference to a widget, and GTK never disposes one off
-    its thread (it is not thread-safe there)."""
+    loop (see the box above)."""
     def worker(box):
-        try:
-            result, error = box[0][0](), None
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI as a message
-            result, error = None, exc
-        GLib.idle_add(finish, box, result, error)
+        box.append(outcome_of(box[0][0]))
+        GLib.idle_add(finish, box)
 
-    def finish(box, result, error):
-        _fn, done = box.pop()
+    def finish(box):
+        (_fn, done), (result, error) = box
+        box.clear()
         done(result, error)   # one call, whatever it returns (a truthy result would repeat it)
         return GLib.SOURCE_REMOVE
 
@@ -972,21 +983,25 @@ class ImageDecoder:
     def work(self):
         while True:
             box = self.jobs.get()
-            _setter, path, width, height, _failed, wanted = box[0]
-            del _setter, _failed
-            keep = wanted is None or wanted()
-            del wanted
-            pixbuf = scaled_pixbuf(path, width, height) if keep else None
-            # Every job goes back to the main loop, also a dropped one: its callbacks hold widgets
-            # (the picture of a card that may be gone already), and if this thread let go of the
-            # last reference, GTK would dispose that widget here, off its thread. This thread keeps
-            # no reference of its own: once finish() has taken the job out, the box is empty.
-            GLib.idle_add(self.finish, box, keep, pixbuf)
-            del box, pixbuf
+            # Every job goes back to the main loop (see the box at run_off_main_loop), also a
+            # dropped one: its callbacks hold widgets, such as the picture of a card that may be
+            # gone already. An error is reported as a failed decode, and the worker goes on.
+            box.append(outcome_of(lambda: self.decode(*box[0])))
+            GLib.idle_add(self.finish, box)
+            del box
 
     @staticmethod
-    def finish(box, keep, pixbuf):
-        setter, _path, _width, _height, failed, _wanted = box.pop()
+    def decode(_setter, path, width, height, _failed, wanted):
+        """(wanted, pixbuf or None); a job no longer wanted is not decoded."""
+        if wanted is not None and not wanted():
+            return False, None
+        return True, scaled_pixbuf(path, width, height)
+
+    @staticmethod
+    def finish(box):
+        (setter, _path, _width, _height, failed, _wanted), (decoded, error) = box
+        box.clear()
+        keep, pixbuf = decoded if error is None else (True, None)
         if not keep:
             pass
         elif pixbuf is not None:
@@ -3779,12 +3794,14 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
 
     def _save_in_background(self, values: dict, then=None):
         """One worker writes these in order; `then` runs on GTK's loop once this write is stored."""
+        def write(job):
+            if callable(job):              # several writes in one go (Reset to defaults)
+                job()
+            else:
+                theme_auto.update_settings(**job)
+
         if self.INLINE_WORKERS:
-            try:
-                values() if callable(values) else theme_auto.update_settings(**values)
-                error = None
-            except OSError as failure:
-                error = failure
+            _result, error = outcome_of(lambda: write(values))
             self._background_saved(error, then)
             return
         jobs = self.__dict__.get("_settings_jobs")
@@ -3793,23 +3810,16 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
 
             def worker():
                 while True:
-                    box = jobs.get()     # boxed: `then` and a callable job may hold widgets
-                    try:
-                        job = box[0][0]
-                        if callable(job):              # several writes in one go (Reset to defaults)
-                            job()
-                        else:
-                            theme_auto.update_settings(**job)
-                        error = None
-                    except OSError as failure:
-                        error = failure
-                    del job
-                    # The main loop takes the job out of the box, so it is never released here.
-                    GLib.idle_add(saved, box, error)
+                    # Boxed (see run_off_main_loop): `then` and a callable job may hold widgets.
+                    # Any error is reported for its own job; the queue goes on.
+                    box = jobs.get()
+                    box.append(outcome_of(lambda: write(box[0][0])))
+                    GLib.idle_add(saved, box)
                     del box
 
-            def saved(box, error):
-                _job, after = box.pop()
+            def saved(box):
+                (_job, after), (_result, error) = box
+                box.clear()
                 self._background_saved(error, after)
                 return GLib.SOURCE_REMOVE
             threading.Thread(target=worker, daemon=True).start()
