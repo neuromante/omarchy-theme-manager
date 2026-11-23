@@ -10,6 +10,7 @@ All file work goes through theme_core, which enforces the trust rules.
 
 import dataclasses
 import colorsys
+import gc
 import math
 import os
 import queue
@@ -904,6 +905,50 @@ class BackgroundNotSet(Exception):
     """A pinned theme was applied, but its wallpaper could not be set."""
 
 
+def run_off_main_loop(fn, on_done):
+    """Run the blocking `fn()` on a worker thread, then `on_done(result, error)` once on the main
+    loop. Both callables usually hold widgets, so they travel in a box that only the main loop
+    empties: the worker never holds the last reference to a widget, and GTK never disposes one off
+    its thread (it is not thread-safe there)."""
+    def worker(box):
+        try:
+            result, error = box[0][0](), None
+        except Exception as exc:  # noqa: BLE001 - surfaced to the UI as a message
+            result, error = None, exc
+        GLib.idle_add(finish, box, result, error)
+
+    def finish(box, result, error):
+        _fn, done = box.pop()
+        done(result, error)   # one call, whatever it returns (a truthy result would repeat it)
+        return GLib.SOURCE_REMOVE
+
+    threading.Thread(target=worker, args=([(fn, on_done)],), daemon=True).start()
+
+
+def collect_garbage_on_main_loop():
+    """Python's cycle collector runs on whichever thread allocates past its threshold, so with
+    worker threads a widget caught in a reference cycle could be disposed on one of them. GTK is
+    not thread-safe there: 2.6.9 aborted in gtk_image_definition_unref while a worker's collection
+    disposed a GtkButton and the main loop built a new one. So the automatic collection is off and
+    GTK's own loop collects instead: the young objects once a second when enough have piled up,
+    everything every half minute (each takes about 2 ms)."""
+    gc.disable()
+    threshold = gc.get_threshold()[0] or 2000
+    checks = 0
+
+    def collect():
+        nonlocal checks
+        checks += 1
+        if checks >= 30:
+            checks = 0
+            gc.collect()
+        elif gc.get_count()[0] >= threshold:
+            gc.collect(1)
+        return GLib.SOURCE_CONTINUE
+
+    return GLib.timeout_add(1000, collect)
+
+
 class ImageDecoder:
     """Decodes previews and wallpaper thumbnails on worker threads and hands
     the result to a Gtk.Picture on the main loop, so neither a large image
@@ -915,33 +960,39 @@ class ImageDecoder:
             threading.Thread(target=self.work, daemon=True).start()
 
     def request(self, picture, path: str, width: int, height: int, setter=None, failed=None, wanted=None):
-        if wanted is None and picture is not None:
-            # A card's own preview: dropped when its picture has left the window before its turn.
-            wanted = lambda pic=picture: not getattr(pic, "_gone", False)
         """`failed`: called on the main loop when the picture cannot be decoded (a waiting animation
         must not wait for it forever). `wanted`: asked before decoding; a job no longer wanted (its
         card gone, its wallpaper rotated away) is dropped without decoding."""
-        self.jobs.put((setter or picture.set_paintable, str(path), width, height, failed, wanted))
+        if wanted is None and picture is not None:
+            # A card's own preview: dropped when its picture has left the window before its turn.
+            wanted = lambda pic=picture: not getattr(pic, "_gone", False)
+        # Boxed: the job holds widgets, and only the main loop takes it out (see work()).
+        self.jobs.put([(setter or picture.set_paintable, str(path), width, height, failed, wanted)])
 
     def work(self):
         while True:
-            setter, path, width, height, failed, wanted = self.jobs.get()
-            if wanted is not None and not wanted():
-                continue
-            pixbuf = scaled_pixbuf(path, width, height)
-            if pixbuf is not None:
-                GLib.idle_add(self.show, setter, pixbuf)
-            elif failed is not None:
-                GLib.idle_add(self.fail, failed)
+            box = self.jobs.get()
+            _setter, path, width, height, _failed, wanted = box[0]
+            del _setter, _failed
+            keep = wanted is None or wanted()
+            del wanted
+            pixbuf = scaled_pixbuf(path, width, height) if keep else None
+            # Every job goes back to the main loop, also a dropped one: its callbacks hold widgets
+            # (the picture of a card that may be gone already), and if this thread let go of the
+            # last reference, GTK would dispose that widget here, off its thread. This thread keeps
+            # no reference of its own: once finish() has taken the job out, the box is empty.
+            GLib.idle_add(self.finish, box, keep, pixbuf)
+            del box, pixbuf
 
     @staticmethod
-    def fail(failed):
-        failed()
-        return GLib.SOURCE_REMOVE
-
-    @staticmethod
-    def show(setter, pixbuf):
-        setter(Gdk.Texture.new_for_pixbuf(pixbuf))
+    def finish(box, keep, pixbuf):
+        setter, _path, _width, _height, failed, _wanted = box.pop()
+        if not keep:
+            pass
+        elif pixbuf is not None:
+            setter(Gdk.Texture.new_for_pixbuf(pixbuf))
+        elif failed is not None:
+            failed()
         return GLib.SOURCE_REMOVE
 
 
@@ -1146,12 +1197,7 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
 
     def on_field_paste(self, text, entry):
         text.stop_emission_by_name("paste-clipboard")
-
-        def worker():
-            pasted = theme_core.clipboard_text()
-            GLib.idle_add(self.insert_pasted, entry, pasted)
-
-        threading.Thread(target=worker, daemon=True).start()
+        run_off_main_loop(theme_core.clipboard_text, lambda pasted, _error: self.insert_pasted(entry, pasted))
 
     def insert_pasted(self, entry, pasted: str | None):
         if pasted is None:
@@ -3747,8 +3793,9 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
 
             def worker():
                 while True:
-                    job, after = jobs.get()
+                    box = jobs.get()     # boxed: `then` and a callable job may hold widgets
                     try:
+                        job = box[0][0]
                         if callable(job):              # several writes in one go (Reset to defaults)
                             job()
                         else:
@@ -3756,10 +3803,18 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
                         error = None
                     except OSError as failure:
                         error = failure
-                    GLib.idle_add(lambda e=error, a=after: self._background_saved(e, a) and False)
+                    del job
+                    # The main loop takes the job out of the box, so it is never released here.
+                    GLib.idle_add(saved, box, error)
+                    del box
+
+            def saved(box, error):
+                _job, after = box.pop()
+                self._background_saved(error, after)
+                return GLib.SOURCE_REMOVE
             threading.Thread(target=worker, daemon=True).start()
         self._jobs_pending = self.__dict__.get("_jobs_pending", 0) + 1
-        jobs.put((values if callable(values) else dict(values), then))
+        jobs.put([(values if callable(values) else dict(values), then)])
 
     def _background_saved(self, error, then=None):
         if not self.INLINE_WORKERS:
@@ -7848,15 +7903,7 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
     def _async(self, fn, on_done):
         """Run a blocking core call off the main loop and hand the result
         back as (result, error) via GLib.idle_add."""
-        def worker():
-            try:
-                result, error = fn(), None
-            except Exception as exc:  # noqa: BLE001 - surfaced to the UI as a message
-                result, error = None, exc
-            # One call, whatever on_done returns: a truthy result would make
-            # idle_add run it again and again.
-            GLib.idle_add(lambda: on_done(result, error) and False)
-        threading.Thread(target=worker, daemon=True).start()
+        run_off_main_loop(fn, on_done)
 
     def on_key(self, _controller, keyval, _keycode, state):
         if state & Gdk.ModifierType.ALT_MASK and not state & (Gdk.ModifierType.CONTROL_MASK |
@@ -8437,6 +8484,7 @@ class ThemeManager(WorkspacesPageMixin, AskPageMixin, Gtk.Application):
 
 
 def main():
+    collect_garbage_on_main_loop()   # before any worker thread starts
     app = ThemeManager()
     atexit.register(cleanup_pid)
     atexit.register(lambda: theme_ai.release_local(wait=1.0))   # ended (also by a signal): never hangs

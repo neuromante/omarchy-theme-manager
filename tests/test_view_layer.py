@@ -2793,6 +2793,91 @@ class ViewLayerTest(unittest.TestCase):
             out.extend(self.descendants(child))
         return out
 
+    # GTK is not thread-safe: a widget whose last reference a worker drops is disposed on that
+    # worker (2.6.9 aborted in gtk_image_definition_unref that way). A Witness stands in for the
+    # widget a callback holds and records the thread it is released on.
+    class Witness:
+        def __init__(self, released):
+            self.released = released
+
+        def __del__(self):
+            import threading
+            self.released.append(threading.current_thread() is threading.main_thread())
+
+    def spin_until_released(self, released):
+        import time
+        context = theme_popup.GLib.MainContext.default()
+        deadline = time.monotonic() + 5
+        while not released and time.monotonic() < deadline:
+            context.iteration(False)
+            time.sleep(0.01)
+        self.assertEqual(released, [True])     # released once, on GTK's thread
+
+    def test_a_dropped_decode_releases_its_widgets_on_gtks_thread(self):
+        released = []
+        witness = self.Witness(released)
+        decoder = theme_popup.ImageDecoder(1)
+        decoder.request(None, "/nonexistent.png", 16, 9, setter=lambda t, w=witness: None,
+                        failed=lambda w=witness: None, wanted=lambda w=witness: False)
+        del witness
+        self.spin_until_released(released)
+
+    def test_a_decoded_picture_releases_its_widgets_on_gtks_thread(self):
+        released, shown = [], []
+        witness = self.Witness(released)
+        path = Path(self.tmp.name) / "decoded.png"
+        path.write_bytes(PNG)
+        decoder = theme_popup.ImageDecoder(1)
+        decoder.request(None, path, 16, 9, setter=lambda t, w=witness: shown.append(t))
+        del witness
+        self.spin_until_released(released)
+        self.assertEqual(len(shown), 1)
+
+    def test_an_async_call_releases_its_callbacks_on_gtks_thread(self):
+        released, results = [], []
+        witness = self.Witness(released)
+        theme_popup.run_off_main_loop(lambda w=witness: 42,
+                                      lambda result, error, w=witness: results.append((result, error)))
+        del witness
+        self.spin_until_released(released)
+        self.assertEqual(results, [(42, None)])
+
+    def test_a_failing_async_call_reports_its_error_once(self):
+        results = []
+
+        def broken():
+            raise ValueError("no")
+        theme_popup.run_off_main_loop(broken, lambda result, error: results.append((result, type(error))) or True)
+        import time
+        context = theme_popup.GLib.MainContext.default()
+        deadline = time.monotonic() + 5
+        while not results and time.monotonic() < deadline:
+            context.iteration(False)
+            time.sleep(0.01)
+        for _ in range(20):                    # a truthy return must not repeat it
+            context.iteration(False)
+        self.assertEqual(results, [(None, ValueError)])
+
+    def test_a_settings_write_releases_its_callback_on_gtks_thread(self):
+        released, done = [], []
+        witness = self.Witness(released)
+        self.app.INLINE_WORKERS = False
+        with patch.object(theme_popup.theme_auto, "update_settings", lambda **_values: None), \
+                patch.object(self.app, "_background_saved",
+                             lambda error, then: done.append(error) or (then and then())):
+            self.app._save_in_background({"x": 1}, then=lambda w=witness: None)
+            del witness
+            self.spin_until_released(released)
+        self.assertEqual(done, [None])
+
+    def test_cycles_are_collected_only_on_gtks_loop(self):
+        import gc
+        was_enabled = gc.isenabled()
+        source = theme_popup.collect_garbage_on_main_loop()
+        self.addCleanup(lambda: (gc.enable() if was_enabled else None))
+        self.addCleanup(theme_popup.GLib.source_remove, source)
+        self.assertFalse(gc.isenabled())       # no collection on whichever thread allocates
+        self.assertGreater(source, 0)          # GTK's loop collects instead
 
 
 class StaleWebAskTests(unittest.TestCase):
